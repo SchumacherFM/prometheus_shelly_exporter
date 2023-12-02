@@ -1,0 +1,267 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"time"
+
+	"github.com/SchumacherFM/prometheus_shelly_exporter/ht"
+	"github.com/eclipse/paho.mqtt.golang"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/version"
+	"github.com/prometheus/exporter-toolkit/web"
+	"github.com/urfave/cli/v2"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+func main() {
+	app := &cli.App{
+		Commands: []*cli.Command{
+			{
+				Name:   "debug",
+				Usage:  "inspect topics and their data",
+				Flags:  []cli.Flag{},
+				Action: actionDebug,
+			},
+			{
+				Name:  "prom",
+				Usage: "forwards the mqtt data towards prometheus",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "http-listen-address",
+						Value:   ":80",
+						EnvVars: []string{"HTTP_LISTEN_ADDRESS"},
+					},
+					&cli.StringFlag{
+						Name:  "http-path-metrics",
+						Value: "/metrics",
+					},
+					&cli.BoolFlag{
+						Name:  "enable-exporter-metrics",
+						Value: false,
+						Usage: "if true sends metrics about the go runtime",
+					},
+				},
+				Action: actionProm,
+			},
+		},
+		Usage: "Converts received data from MQTT towards prometheus format",
+		Flags: []cli.Flag{
+			&cli.StringSliceFlag{
+				Name:     "mqtt-url",
+				Required: true,
+				Usage:    "mqtt://hostname:port",
+				EnvVars:  []string{"MQTT_HOSTS"},
+			},
+			&cli.StringFlag{
+				Name:    "mqtt-user",
+				Value:   "",
+				Usage:   "mqtt username",
+				EnvVars: []string{"MQTT_USERNAME"},
+			},
+			&cli.StringFlag{
+				Name:    "mqtt-pass",
+				Value:   "",
+				Usage:   "mqtt password",
+				EnvVars: []string{"MQTT_PASSWORD"},
+			},
+			&cli.StringSliceFlag{
+				Name:    "topic",
+				Aliases: []string{"t"},
+				Value:   cli.NewStringSlice("shellies/+/info"), // "shellies/+/online"
+				Usage:   "MQTT Topics http://www.steves-internet-guide.com/understanding-mqtt-topics/",
+			},
+			&cli.BoolFlag{
+				Name:  "verbose",
+				Value: false,
+			},
+		},
+	}
+
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newMQTTClient(c *cli.Context) (mqtt.Client, func(), error) {
+	o := mqtt.NewClientOptions()
+	for _, mqttUrl := range c.StringSlice("mqtt-url") {
+		u, err := url.Parse(mqttUrl)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed tp parse URL: %q with: %w", mqttUrl, err)
+		}
+		o.Servers = append(o.Servers, u)
+	}
+	o.Username = c.String("mqtt-user")
+	o.Password = c.String("mqtt-pass")
+	o.AutoReconnect = true
+
+	mqc := mqtt.NewClient(o)
+
+	tk := mqc.Connect()
+	<-tk.Done()
+	if err := tk.Error(); err != nil {
+		return nil, nil, fmt.Errorf("failed tp connect: %w", err)
+	}
+
+	return mqc, func() {
+		mqc.Disconnect(100)
+	}, nil
+}
+
+func actionDebug(c *cli.Context) error {
+	mqc, cancel, err := newMQTTClient(c)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	for _, topic := range c.StringSlice("topic") {
+		tk := mqc.Subscribe(topic, 0, func(client mqtt.Client, message mqtt.Message) {
+			t := time.Now().Format(time.RFC3339Nano)
+			fmt.Printf("%s: message topic: %s\n", t, message.Topic())
+			fmt.Printf("%s: message payload: %s\n", t, string(message.Payload()))
+			message.Ack()
+		})
+		<-tk.Done()
+		if err := tk.Error(); err != nil {
+			return err
+		} else {
+			fmt.Println("subscribed to:", topic)
+		}
+
+	}
+
+	fmt.Println("blocking and waiting for messages")
+	<-c.Done() // wait until someone kills us
+
+	return nil
+}
+
+func actionProm(c *cli.Context) error {
+	mqc, cancel, err := newMQTTClient(c)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	zapencCfg := zap.NewProductionEncoderConfig()
+	zapencCfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+
+	zapLvl := zap.InfoLevel
+	if c.Bool("verbose") {
+		zapLvl = zap.DebugLevel
+	}
+	zaplog := zap.New(zapcore.NewCore(
+		zapcore.NewJSONEncoder(zapencCfg),
+		zapcore.AddSync(os.Stdout),
+		zapLvl,
+	))
+	defer zaplog.Sync()
+
+	messageChan := make(chan mqtt.Message)
+	go subscribe(c, mqc, zaplog, messageChan)
+	defer mqc.Unsubscribe(c.StringSlice("topic")...)
+	defer close(messageChan)
+
+	reg := prometheus.NewPedanticRegistry()
+	reg.MustRegister(ht.NewCollector(c.Context, messageChan, ht.Options{
+		Timeout: 60 * time.Second,
+		Log:     zaplog,
+	}))
+	if c.Bool("enable-exporter-metrics") {
+		reg.MustRegister(
+			collectors.NewBuildInfoCollector(),
+			collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+			collectors.NewGoCollector(),
+			version.NewCollector("shelly_exporter"),
+		)
+	}
+
+	http.Handle(c.String("http-path-metrics"), promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html>
+			<head><title>Shelly Exporter</title></head>
+			<body>
+			<h1>Shelly Exporter</h1>
+			<p><a href="` + c.String("http-path-metrics") + `">Metrics</a></p>
+			</body>
+			</html>`))
+	})
+
+	server := &http.Server{}
+
+	zaplog.Info("http config",
+		zap.String("path", c.String("http-path-metrics")),
+		zap.String("listen_address", c.String("http-listen-address")),
+	)
+	var empty string
+	if err := web.ListenAndServe(server, &web.FlagConfig{
+		WebListenAddresses: &[]string{c.String("http-listen-address")},
+		WebSystemdSocket:   nil,
+		WebConfigFile:      &empty,
+	}, wraplog{zaplog}); err != nil {
+		zaplog.Fatal("ListenAndServe failed", zap.Error(err))
+		return err
+	}
+
+	return nil
+}
+
+func subscribe(c *cli.Context, mqc mqtt.Client, log *zap.Logger, messageChan chan<- mqtt.Message) {
+	for _, topic := range c.StringSlice("topic") {
+		tk := mqc.Subscribe(topic, 0, func(client mqtt.Client, message mqtt.Message) {
+			messageChan <- message
+			message.Ack()
+		})
+		<-tk.Done()
+		if err := tk.Error(); err != nil {
+			log.Error("subscribe failed", zap.Error(err), zap.String("topic", topic))
+		} else {
+			log.Info("subscribed to", zap.String("topic", topic))
+		}
+	}
+}
+
+type wraplog struct {
+	*zap.Logger
+}
+
+func (w wraplog) Log(keyvals ...interface{}) error {
+	keylen := len(keyvals)
+
+	var level string
+	var msg string
+	data := make([]zap.Field, 0, (keylen/2)+1)
+	for i := 0; i < keylen; i += 2 {
+		key := fmt.Sprint(keyvals[i])
+		switch key {
+		case "level":
+			level = keyvals[i+1].(fmt.Stringer).String()
+		case "msg":
+			msg = keyvals[i+1].(string)
+		default:
+			data = append(data, zap.Any(key, keyvals[i+1]))
+		}
+	}
+
+	switch level {
+	case "debug":
+		w.Debug(msg, data...)
+	case "info":
+		w.Info(msg, data...)
+	case "warn":
+		w.Warn(msg, data...)
+	case "error":
+		w.Error(msg, data...)
+	case "fatal":
+		w.Fatal(msg, data...)
+	}
+	return nil
+}
