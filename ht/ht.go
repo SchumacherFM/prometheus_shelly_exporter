@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// Info represents the minimal data. If you want more, let me know.
 type Info struct {
 	Mac     string `json:"mac"`
 	IsValid bool   `json:"is_valid"`
@@ -59,6 +60,11 @@ func NewCollector(ctx context.Context, messageChan <-chan mqtt.Message, opts Opt
 		humDesc: prometheus.NewDesc("shellyht_humidity", "Sensor humidity", []string{"device", "unit"}, nil),
 		batDesc: prometheus.NewDesc("shellyht_battery", "Sensor battery", []string{"device", "unit"}, nil),
 		upDesc:  prometheus.NewDesc("shellyht_up", "Whether scrape was successful", []string{"status"}, nil),
+		lastMSG: lastMSG{
+			time:  time.Now(),
+			topic: nullTopic,
+			msg:   nullMessage{},
+		},
 	}
 
 	go func() {
@@ -125,4 +131,35 @@ func (c *Collector) collect(ctx context.Context, ch chan<- prometheus.Metric) er
 	}
 
 	return nil
+}
+
+const nullTopic = "shellies/null/info"
+
+type nullMessage struct{}
+
+func (nullMessage) Duplicate() bool {
+	return false
+}
+
+func (nullMessage) Qos() byte {
+	return 0
+}
+
+func (nullMessage) Retained() bool {
+	return false
+}
+
+func (nullMessage) Topic() string {
+	return nullTopic
+}
+
+func (nullMessage) MessageID() uint16 {
+	return 0
+}
+
+func (nullMessage) Payload() []byte {
+	return []byte(`{}`)
+}
+
+func (nullMessage) Ack() {
 }
