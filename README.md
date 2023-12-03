@@ -2,9 +2,9 @@
 
 This exporter exports some metrics from Shelly to Prometheus.
 
-Testes with:
-- Shelly H&T
-- WIP
+Tested with:
+- Shelly H&T - only humidity and temperature
+- WIP (1PM and 3EM)
  
 
 ## Build
