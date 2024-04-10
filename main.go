@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/SchumacherFM/prometheus_shelly_exporter/ht"
+	"github.com/SchumacherFM/prometheus_shelly_exporter/threeem"
 	"github.com/eclipse/paho.mqtt.golang"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -124,9 +125,8 @@ func actionDebug(c *cli.Context) error {
 
 	for _, topic := range c.StringSlice("topic") {
 		tk := mqc.Subscribe(topic, 0, func(client mqtt.Client, message mqtt.Message) {
-			t := time.Now().Format(time.RFC3339Nano)
-			fmt.Printf("%s: message topic: %s\n", t, message.Topic())
-			fmt.Printf("%s: message payload: %s\n", t, string(message.Payload()))
+			t := time.Now().Format("2006-01-02T15:04:05.999")
+			fmt.Printf("%s::: message topic:: %s=%s\n", t, message.Topic(), string(message.Payload()))
 			message.Ack()
 		})
 		<-tk.Done()
@@ -165,16 +165,25 @@ func actionProm(c *cli.Context) error {
 	))
 	defer zaplog.Sync()
 
-	messageChan := make(chan mqtt.Message)
-	go subscribe(c, mqc, zaplog, messageChan)
+	messageChanHT := make(chan mqtt.Message)
+	messageChan3EM := make(chan mqtt.Message)
+	go subscribe(c, mqc, zaplog, messageChanHT, messageChan3EM)
 	defer mqc.Unsubscribe(c.StringSlice("topic")...)
-	defer close(messageChan)
+	defer func() {
+		close(messageChanHT)
+		close(messageChan3EM)
+	}()
 
 	reg := prometheus.NewPedanticRegistry()
-	reg.MustRegister(ht.NewCollector(c.Context, messageChan, ht.Options{
+	reg.MustRegister(ht.NewCollector(c.Context, messageChanHT, ht.Options{
 		Timeout: 60 * time.Second,
 		Log:     zaplog,
 	}))
+	reg.MustRegister(threeem.NewCollector(c.Context, messageChan3EM, threeem.Options{
+		Timeout: 60 * time.Second,
+		Log:     zaplog,
+	}))
+
 	if c.Bool("enable-exporter-metrics") {
 		reg.MustRegister(
 			collectors.NewBuildInfoCollector(),
@@ -214,10 +223,13 @@ func actionProm(c *cli.Context) error {
 	return nil
 }
 
-func subscribe(c *cli.Context, mqc mqtt.Client, log *zap.Logger, messageChan chan<- mqtt.Message) {
+func subscribe(c *cli.Context, mqc mqtt.Client, log *zap.Logger, messageChans ...chan<- mqtt.Message) {
+	log.Info("subscribing to", zap.Strings("topics", c.StringSlice("topic")))
 	for _, topic := range c.StringSlice("topic") {
 		tk := mqc.Subscribe(topic, 0, func(client mqtt.Client, message mqtt.Message) {
-			messageChan <- message
+			for _, messageChan := range messageChans {
+				messageChan <- message
+			}
 			message.Ack()
 		})
 		<-tk.Done()

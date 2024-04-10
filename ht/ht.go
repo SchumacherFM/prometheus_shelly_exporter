@@ -74,6 +74,9 @@ func NewCollector(ctx context.Context, messageChan <-chan mqtt.Message, opts Opt
 				if !ok {
 					return
 				}
+				if false == strings.HasSuffix(msg.Topic(), "/info") {
+					continue
+				}
 
 				c.lastMSG = lastMSG{
 					time:  time.Now(),
