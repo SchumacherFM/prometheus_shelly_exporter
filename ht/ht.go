@@ -83,7 +83,7 @@ func NewCollector(ctx context.Context, messageChan <-chan mqtt.Message, opts Opt
 					topic: msg.Topic(),
 					msg:   msg,
 				}
-				opts.Log.Info("message from mqtt",
+				opts.Log.Debug("message from mqtt",
 					zap.String("topic", msg.Topic()),
 					zap.Int("length", len(msg.Payload())))
 

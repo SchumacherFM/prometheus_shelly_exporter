@@ -3,19 +3,22 @@ package main
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"time"
 
 	"github.com/SchumacherFM/prometheus_shelly_exporter/ht"
+	"github.com/SchumacherFM/prometheus_shelly_exporter/htgen3"
 	"github.com/SchumacherFM/prometheus_shelly_exporter/threeem"
 	"github.com/eclipse/paho.mqtt.golang"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
+	slogzap "github.com/samber/slog-zap/v2"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -166,16 +169,22 @@ func actionProm(c *cli.Context) error {
 	defer zaplog.Sync()
 
 	messageChanHT := make(chan mqtt.Message)
+	messageChanHTGen3 := make(chan mqtt.Message)
 	messageChan3EM := make(chan mqtt.Message)
-	go subscribe(c, mqc, zaplog, messageChanHT, messageChan3EM)
+	go subscribe(c, mqc, zaplog, messageChanHT, messageChanHTGen3, messageChan3EM)
 	defer mqc.Unsubscribe(c.StringSlice("topic")...)
 	defer func() {
 		close(messageChanHT)
+		close(messageChanHTGen3)
 		close(messageChan3EM)
 	}()
 
 	reg := prometheus.NewPedanticRegistry()
 	reg.MustRegister(ht.NewCollector(c.Context, messageChanHT, ht.Options{
+		Timeout: 60 * time.Second,
+		Log:     zaplog,
+	}))
+	reg.MustRegister(htgen3.NewCollector(c.Context, messageChanHTGen3, htgen3.Options{
 		Timeout: 60 * time.Second,
 		Log:     zaplog,
 	}))
@@ -210,12 +219,15 @@ func actionProm(c *cli.Context) error {
 		zap.String("path", c.String("http-path-metrics")),
 		zap.String("listen_address", c.String("http-listen-address")),
 	)
+
+	slogLogWrap := slog.New(slogzap.Option{Level: slog.LevelDebug, Logger: zaplog}.NewZapHandler())
+
 	var empty string
 	if err := web.ListenAndServe(server, &web.FlagConfig{
 		WebListenAddresses: &[]string{c.String("http-listen-address")},
 		WebSystemdSocket:   nil,
 		WebConfigFile:      &empty,
-	}, wraplog{zaplog}); err != nil {
+	}, slogLogWrap); err != nil {
 		zaplog.Fatal("ListenAndServe failed", zap.Error(err))
 		return err
 	}
@@ -239,41 +251,4 @@ func subscribe(c *cli.Context, mqc mqtt.Client, log *zap.Logger, messageChans ..
 			log.Info("subscribed to", zap.String("topic", topic))
 		}
 	}
-}
-
-type wraplog struct {
-	*zap.Logger
-}
-
-func (w wraplog) Log(keyvals ...interface{}) error {
-	keylen := len(keyvals)
-
-	var level string
-	var msg string
-	data := make([]zap.Field, 0, (keylen/2)+1)
-	for i := 0; i < keylen; i += 2 {
-		key := fmt.Sprint(keyvals[i])
-		switch key {
-		case "level":
-			level = keyvals[i+1].(fmt.Stringer).String()
-		case "msg":
-			msg = keyvals[i+1].(string)
-		default:
-			data = append(data, zap.Any(key, keyvals[i+1]))
-		}
-	}
-
-	switch level {
-	case "debug":
-		w.Debug(msg, data...)
-	case "info":
-		w.Info(msg, data...)
-	case "warn":
-		w.Warn(msg, data...)
-	case "error":
-		w.Error(msg, data...)
-	case "fatal":
-		w.Fatal(msg, data...)
-	}
-	return nil
 }
